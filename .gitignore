@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Project specific
+test_output/
+
+# Claude / AI tools
+.claude/
+
+# Environment variables
+.env
+.env.*
+
+# Cache
+.pytest_cache/
