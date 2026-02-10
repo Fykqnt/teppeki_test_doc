@@ -128,8 +128,8 @@ python -m redactor.evaluate --input ./test_md --limit 50
 │                             │                                    │
 │                             ▼                                    │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │         Session Store (Redis / Firestore)               │    │
-│  │         マッピング情報の一時保存                           │    │
+│  │              Session Store (Upstash Redis)              │    │
+│  │         マッピング情報の一時保存（TTL: 24時間）            │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -144,9 +144,8 @@ python -m redactor.evaluate --input ./test_md --limit 50
 | WSGIサーバー | Uvicorn | 本番環境ではGunicorn + Uvicorn workers |
 | コンテナ | Docker | マルチステージビルド推奨 |
 | ホスティング | Google Cloud Run | サーバーレス、自動スケーリング |
-| セッションストア | Cloud Firestore or Memorystore (Redis) | マッピング情報の保存 |
+| セッションストア | Upstash Redis | サーバーレスRedis、ネイティブTTL、低レイテンシ |
 | シークレット管理 | Secret Manager | APIキー等の機密情報 |
-| CI/CD | Cloud Build | GitHub連携、自動デプロイ |
 | コンテナレジストリ | Artifact Registry | Dockerイメージの保存 |
 | ログ・監視 | Cloud Logging / Cloud Monitoring | 構造化ログ、アラート |
 
@@ -269,8 +268,7 @@ Cloud Runのヘルスチェック用エンドポイント。
 │   └── store/
 │       ├── __init__.py
 │       ├── base.py           # ストアの抽象基底クラス
-│       ├── firestore.py      # Firestore実装
-│       └── redis.py          # Redis実装（オプション）
+│       └── redis.py          # Upstash Redis実装
 │
 ├── redactor/                 # 既存のRedactorエンジン
 │   ├── redactor.py
@@ -286,7 +284,6 @@ Cloud Runのヘルスチェック用エンドポイント。
 │
 ├── Dockerfile
 ├── docker-compose.yml        # ローカル開発用
-├── cloudbuild.yaml           # Cloud Build設定
 ├── requirements.txt
 ├── requirements-dev.txt      # 開発用依存関係
 ├── .env.example
@@ -352,18 +349,12 @@ class Settings(BaseSettings):
     
     # セキュリティ
     API_KEY: str  # 必須: 鉄壁AIからの認証用
-    ALLOWED_ORIGINS: List[str] = ["https://teppeki-ai.vercel.app"]
+    ALLOWED_ORIGINS: List[str] = ["https://app.teppeki.ai"]
     
-    # セッションストア
-    SESSION_STORE_TYPE: str = "firestore"  # "firestore" or "redis"
+    # セッションストア（Upstash Redis）
+    UPSTASH_REDIS_REST_URL: str  # 必須: Upstash REST API URL
+    UPSTASH_REDIS_REST_TOKEN: str  # 必須: Upstash REST API Token
     SESSION_TTL_SECONDS: int = 86400  # 24時間
-    
-    # Firestore設定
-    GCP_PROJECT_ID: str | None = None
-    FIRESTORE_COLLECTION: str = "redactor_sessions"
-    
-    # Redis設定（オプション）
-    REDIS_URL: str | None = None
     
     # Redactor設定
     DETECTION_THRESHOLD: float = 0.85
@@ -431,50 +422,70 @@ async def verify_api_key(api_key: str = Security(api_key_header)) -> str:
     return api_key
 ```
 
-### 5. セッションストア（app/store/firestore.py）
+### 5. セッションストア（app/store/redis.py）
 
 ```python
-from google.cloud import firestore
+from upstash_redis.asyncio import Redis
 from typing import Dict, Optional
-from datetime import datetime, timedelta
+import json
 from app.core.config import settings
 
-class FirestoreSessionStore:
+class RedisSessionStore:
+    """
+    Upstash Redisを使用したセッションストア
+    
+    Upstash Redisを選択した理由:
+    - ネイティブTTLサポート（自動削除が1行で実装可能）
+    - 低レイテンシ（1-5ms）でチャットのレスポンス速度向上
+    - サーバーレス対応（コネクション管理不要、Cloud Runと相性良好）
+    - REST API対応でHTTPベースのアクセスも可能
+    - Key-Valueストアとしてマッピング保存に最適
+    """
+    
     def __init__(self):
-        self.db = firestore.AsyncClient(project=settings.GCP_PROJECT_ID)
-        self.collection = settings.FIRESTORE_COLLECTION
+        self.redis = Redis(
+            url=settings.UPSTASH_REDIS_REST_URL,
+            token=settings.UPSTASH_REDIS_REST_TOKEN
+        )
         self.ttl = settings.SESSION_TTL_SECONDS
+        self.key_prefix = "session:"
+
+    def _get_key(self, session_id: str) -> str:
+        """セッションIDからRedisキーを生成"""
+        return f"{self.key_prefix}{session_id}"
 
     async def save_mapping(self, session_id: str, mapping: Dict[str, str]) -> None:
-        """マッピング情報を保存（既存があればマージ）"""
-        doc_ref = self.db.collection(self.collection).document(session_id)
-        doc = await doc_ref.get()
+        """マッピング情報を保存（既存があればマージ）、TTL付きで自動削除"""
+        key = self._get_key(session_id)
         
-        if doc.exists:
-            existing = doc.to_dict().get("mapping", {})
+        # 既存のマッピングを取得してマージ
+        existing = await self.get_mapping(session_id)
+        if existing:
             mapping = {**existing, **mapping}
         
-        await doc_ref.set({
-            "mapping": mapping,
-            "updated_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(seconds=self.ttl)
-        })
+        # TTL付きで保存（24時間後に自動削除）
+        await self.redis.setex(key, self.ttl, json.dumps(mapping))
 
     async def get_mapping(self, session_id: str) -> Optional[Dict[str, str]]:
         """マッピング情報を取得"""
-        doc_ref = self.db.collection(self.collection).document(session_id)
-        doc = await doc_ref.get()
+        key = self._get_key(session_id)
+        data = await self.redis.get(key)
         
-        if not doc.exists:
+        if data is None:
             return None
         
-        return doc.to_dict().get("mapping", {})
+        return json.loads(data)
 
     async def delete_session(self, session_id: str) -> bool:
         """セッションを削除"""
-        doc_ref = self.db.collection(self.collection).document(session_id)
-        await doc_ref.delete()
+        key = self._get_key(session_id)
+        await self.redis.delete(key)
         return True
+    
+    async def extend_ttl(self, session_id: str) -> bool:
+        """セッションのTTLを延長（アクティブなセッション用）"""
+        key = self._get_key(session_id)
+        return await self.redis.expire(key, self.ttl)
 ```
 
 ### 6. 秘匿化エンドポイント（app/api/routes/anonymize.py）
@@ -562,63 +573,6 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 ---
 
-## Cloud Build設定（cloudbuild.yaml）
-
-```yaml
-steps:
-  # Dockerイメージのビルド
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'build'
-      - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${SHORT_SHA}'
-      - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:latest'
-      - '.'
-
-  # Artifact Registryへプッシュ
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - '--all-tags'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}'
-
-  # Cloud Runへデプロイ
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: gcloud
-    args:
-      - 'run'
-      - 'deploy'
-      - '${_SERVICE_NAME}'
-      - '--image'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${SHORT_SHA}'
-      - '--region'
-      - '${_REGION}'
-      - '--platform'
-      - 'managed'
-      - '--allow-unauthenticated'
-      - '--memory'
-      - '2Gi'
-      - '--cpu'
-      - '2'
-      - '--min-instances'
-      - '0'
-      - '--max-instances'
-      - '10'
-      - '--set-secrets'
-      - 'API_KEY=redactor-api-key:latest'
-
-substitutions:
-  _REGION: asia-northeast1
-  _REPOSITORY: teppeki-redactor
-  _SERVICE_NAME: redactor-api
-
-options:
-  logging: CLOUD_LOGGING_ONLY
-```
-
----
-
 ## 環境変数一覧
 
 ### 本番環境（Cloud Run）
@@ -626,10 +580,10 @@ options:
 | 変数名 | 説明 | 設定方法 |
 |--------|------|----------|
 | `API_KEY` | 鉄壁AIからの認証キー | Secret Manager |
-| `GCP_PROJECT_ID` | GCPプロジェクトID | 自動設定 |
-| `SESSION_STORE_TYPE` | `firestore` | 環境変数 |
-| `FIRESTORE_COLLECTION` | `redactor_sessions` | 環境変数 |
-| `ALLOWED_ORIGINS` | `https://teppeki-ai.vercel.app` | 環境変数 |
+| `UPSTASH_REDIS_REST_URL` | Upstash Redis REST API URL | Secret Manager |
+| `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST API Token | Secret Manager |
+| `SESSION_TTL_SECONDS` | セッションTTL（デフォルト: 86400秒 = 24時間） | 環境変数 |
+| `ALLOWED_ORIGINS` | `https://app.teppeki.ai` | 環境変数 |
 | `DETECTION_THRESHOLD` | `0.85` | 環境変数 |
 
 ### ローカル開発（.env）
@@ -639,11 +593,9 @@ options:
 DEBUG=true
 API_KEY=dev-api-key-12345
 
-# セッションストア
-SESSION_STORE_TYPE=firestore
-GCP_PROJECT_ID=your-project-id
-FIRESTORE_COLLECTION=redactor_sessions_dev
-GOOGLE_APPLICATION_CREDENTIALS=./service-account.json
+# セッションストア（Upstash Redis）
+UPSTASH_REDIS_REST_URL=https://xxx.upstash.io
+UPSTASH_REDIS_REST_TOKEN=AXxxxxxxxxxxxx
 
 # CORS
 ALLOWED_ORIGINS=["http://localhost:3000"]
@@ -738,8 +690,8 @@ export async function deleteSession(sessionId: string): Promise<void> {
 1. **API認証**: `X-API-Key`ヘッダーによる認証必須
 2. **HTTPS強制**: Cloud RunはデフォルトでマネージドSSL
 3. **CORS制限**: 鉄壁AIのドメインのみ許可
-4. **Secret Manager**: APIキー等の機密情報は環境変数に直接書かない
-5. **セッションTTL**: マッピング情報は24時間で自動削除
+4. **Secret Manager**: APIキー、Upstash認証情報等の機密情報は環境変数に直接書かない
+5. **セッションTTL**: RedisのネイティブTTL機能により、マッピング情報は24時間で自動削除（追加のバッチ処理不要）
 6. **入力バリデーション**: テキスト長の上限チェック（50,000文字）
 
 ---
@@ -782,10 +734,8 @@ gcloud config set project YOUR_PROJECT_ID
 
 # 2. 必要なAPIを有効化
 gcloud services enable \
-  cloudbuild.googleapis.com \
   run.googleapis.com \
   artifactregistry.googleapis.com \
-  firestore.googleapis.com \
   secretmanager.googleapis.com
 
 # 3. Artifact Registryリポジトリ作成
@@ -793,23 +743,63 @@ gcloud artifacts repositories create teppeki-redactor \
   --repository-format=docker \
   --location=asia-northeast1
 
-# 4. Secret Managerにシークレット登録
-echo -n "your-api-key" | gcloud secrets create redactor-api-key \
-  --data-file=-
+# 4. Upstash Redisの作成
+#    - https://console.upstash.com/ でアカウント作成
+#    - 新しいRedisデータベースを作成（リージョン: asia-northeast1推奨）
+#    - REST API URLとTokenを取得
 
-# 5. Cloud Buildトリガー作成（GitHub連携）
-gcloud builds triggers create github \
-  --repo-name=teppeki-redactor \
-  --repo-owner=your-org \
-  --branch-pattern=^main$ \
-  --build-config=cloudbuild.yaml
+# 5. Secret Managerにシークレット登録
+echo -n "your-api-key" | gcloud secrets create redactor-api-key --data-file=-
+echo -n "https://xxx.upstash.io" | gcloud secrets create upstash-redis-url --data-file=-
+echo -n "AXxxxxxxxxxxxx" | gcloud secrets create upstash-redis-token --data-file=-
+
+# 6. Docker認証設定
+gcloud auth configure-docker asia-northeast1-docker.pkg.dev
 ```
 
-### 手動デプロイ
+### デプロイ（ソースから直接）
+
+Cloud Runはソースコードから直接デプロイできます（Dockerfileが存在する場合）:
 
 ```bash
-# ローカルからビルド＆デプロイ
-gcloud builds submit --config=cloudbuild.yaml
+gcloud run deploy redactor-api \
+  --source . \
+  --region asia-northeast1 \
+  --platform managed \
+  --allow-unauthenticated \
+  --memory 2Gi \
+  --cpu 2 \
+  --min-instances 0 \
+  --max-instances 10 \
+  --set-secrets API_KEY=redactor-api-key:latest \
+  --set-secrets UPSTASH_REDIS_REST_URL=upstash-redis-url:latest \
+  --set-secrets UPSTASH_REDIS_REST_TOKEN=upstash-redis-token:latest
+```
+
+### デプロイ（Dockerイメージをビルドしてからデプロイ）
+
+より細かい制御が必要な場合:
+
+```bash
+# 1. Dockerイメージをビルド
+docker build -t asia-northeast1-docker.pkg.dev/YOUR_PROJECT_ID/teppeki-redactor/redactor-api:latest .
+
+# 2. Artifact Registryへプッシュ
+docker push asia-northeast1-docker.pkg.dev/YOUR_PROJECT_ID/teppeki-redactor/redactor-api:latest
+
+# 3. Cloud Runへデプロイ
+gcloud run deploy redactor-api \
+  --image asia-northeast1-docker.pkg.dev/YOUR_PROJECT_ID/teppeki-redactor/redactor-api:latest \
+  --region asia-northeast1 \
+  --platform managed \
+  --allow-unauthenticated \
+  --memory 2Gi \
+  --cpu 2 \
+  --min-instances 0 \
+  --max-instances 10 \
+  --set-secrets API_KEY=redactor-api-key:latest \
+  --set-secrets UPSTASH_REDIS_REST_URL=upstash-redis-url:latest \
+  --set-secrets UPSTASH_REDIS_REST_TOKEN=upstash-redis-token:latest
 ```
 
 ---
@@ -829,9 +819,21 @@ uvicorn app.main:app --reload --port 8000
 
 # テスト実行
 pytest -v
+```
 
-# Firestore エミュレータ起動（オプション）
-gcloud emulators firestore start --host-port=localhost:8081
+### Upstash Redis開発環境
+
+ローカル開発では以下の選択肢があります:
+
+1. **Upstash開発用データベース（推奨）**: Upstashで開発用の別データベースを作成
+2. **ローカルRedis**: Docker等でローカルRedisを起動（`redis://localhost:6379`）
+
+```bash
+# ローカルRedisを使う場合（オプション）
+docker run -d --name redis-local -p 6379:6379 redis:alpine
+
+# ローカルRedis用の環境変数（upstash-redis-pythonはREST APIのみ対応のため、redis-pyを使用）
+# 開発時はredis-pyとUpstash REST APIの両方に対応した実装が必要な場合あり
 ```
 
 ---
